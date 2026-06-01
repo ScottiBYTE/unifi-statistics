@@ -1,0 +1,7 @@
+{
+  "unifiUrl": "https://YOUR-UNIFI-GATEWAY",
+  "username": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD",
+  "site": "default",
+  "port": 3050
+}

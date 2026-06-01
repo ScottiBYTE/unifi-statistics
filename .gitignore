@@ -1,0 +1,22 @@
+# Secrets / local config
+.env
+config.json
+*.local
+*.secret
+
+# Runtime data
+data/
+logs/
+*.log
+
+# Dependencies
+node_modules/
+
+# OS/editor
+.DS_Store
+*.swp
+*.bak
+
+# Backups created by patches
+*.before-*
+server.js.before-*

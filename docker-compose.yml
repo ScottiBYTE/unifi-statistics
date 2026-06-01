@@ -1,0 +1,12 @@
+services:
+  unifi-statistics:
+    build: .
+    image: scottibyte/unifi-statistics:latest
+    container_name: unifi-statistics
+    restart: unless-stopped
+    ports:
+      - "80:3050"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

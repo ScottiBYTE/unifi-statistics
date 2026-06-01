@@ -1,0 +1,9 @@
+{
+  "name": "unifi-statistics",
+  "version": "2.1.0",
+  "main": "server.js",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "express": "^4.18.3"
+  }
+}
