@@ -1,9 +1,11 @@
 FROM node:20-alpine
 
+ENV CHROMIUM_EXECUTABLE=/usr/bin/chromium-browser
+
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont && npm install
 
 COPY server.js ./
 COPY public ./public

@@ -1,9 +1,10 @@
 {
   "name": "unifi-statistics",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "main": "server.js",
   "dependencies": {
     "axios": "^1.7.9",
-    "express": "^4.18.3"
+    "express": "^4.18.3",
+    "puppeteer-core": "*"
   }
 }

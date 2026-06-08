@@ -7,6 +7,13 @@ const packageJson = require("./package.json");
 
 const https = require("https");
 
+let puppeteer = null;
+try {
+  puppeteer = require("puppeteer-core");
+} catch {
+  puppeteer = null;
+}
+
 function loadConfig() {
   const fallbackPath = "./config.json";
   let fileConfig = {};
@@ -1114,6 +1121,196 @@ function releaseSvcPaths(app, version) {
     .map(slug => `https://community.svc.ui.com/releases/${slug}/${encoded}`);
 }
 
+
+const HEADLESS_RELEASE_CACHE_MS = 12 * 60 * 60 * 1000;
+let headlessReleaseCache = {};
+
+
+function unifiOsReleaseTitleSlugs(version) {
+  const vDash = String(version || "")
+    .trim()
+    .replace(/^v/i, "")
+    .replace(/\./g, "-");
+
+  if (!vDash) return [];
+
+  const modelText = [
+    appVersionCache?.lastGatewayModel,
+    appVersionCache?.lastGatewayName
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  if (modelText.includes("uck") || modelText.includes("cloud key")) {
+    return [`UniFi-OS-Cloud-Keys-${vDash}`];
+  }
+
+  if (
+    modelText.includes("ucg") ||
+    modelText.includes("uxg") ||
+    modelText.includes("cloud gateway")
+  ) {
+    return [`UniFi-OS-Cloud-Gateways-${vDash}`];
+  }
+
+  if (modelText.includes("ux") || modelText.includes("express")) {
+    return [`UniFi-OS-Express-${vDash}`];
+  }
+
+  if (modelText.includes("udm") || modelText.includes("dream")) {
+    return [`UniFi-OS-Dream-Machines-${vDash}`];
+  }
+
+  // If the model is unknown, try the common UniFi OS release families.
+  return [
+    `UniFi-OS-Dream-Machines-${vDash}`,
+    `UniFi-OS-Cloud-Gateways-${vDash}`,
+    `UniFi-OS-Cloud-Keys-${vDash}`,
+    `UniFi-OS-Express-${vDash}`
+  ];
+}
+
+function browserReleaseTitleSlug(appName, version) {
+  const vDash = String(version || "")
+    .trim()
+    .replace(/^v/i, "")
+    .replace(/\./g, "-");
+
+  if (!vDash) return "";
+
+  if (appName === "unifiOS") {
+    return unifiOsReleaseTitleSlugs(version)[0] || "";
+  }
+
+  const map = {
+    network: `UniFi-Network-Application-${vDash}`,
+    protect: `UniFi-Protect-Application-${vDash}`,
+    talk: `UniFi-Talk-Application-${vDash}`,
+    access: `UniFi-Access-Application-${vDash}`
+  };
+
+  return map[appName] || "";
+}
+
+function chromiumExecutablePath() {
+  const candidates = [
+    process.env.CHROMIUM_EXECUTABLE,
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome"
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      // Try next candidate.
+    }
+  }
+
+  return candidates[0] || "/usr/bin/chromium-browser";
+}
+
+async function resolveReleaseUrlWithHeadlessBrowser(appName, version) {
+  if (!puppeteer) return null;
+
+  const slugs = appName === "unifiOS"
+    ? unifiOsReleaseTitleSlugs(version)
+    : [browserReleaseTitleSlug(appName, version)].filter(Boolean);
+
+  if (!slugs.length) return null;
+
+  const cacheKey = `${appName}:${String(version || "").trim()}`;
+  const cached = headlessReleaseCache[cacheKey];
+
+  if (cached && Date.now() - cached.ts < HEADLESS_RELEASE_CACHE_MS) {
+    return cached.url;
+  }
+
+  let browser = null;
+
+  try {
+    browser = await puppeteer.launch({
+      executablePath: chromiumExecutablePath(),
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote"
+      ]
+    });
+
+    const page = await browser.newPage();
+
+    await page.setUserAgent(
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    );
+
+    for (const slug of slugs) {
+      const searchUrl = `https://community.ui.com/releases?q=${encodeURIComponent(slug)}`;
+
+      await page.goto(searchUrl, {
+        waitUntil: "networkidle2",
+        timeout: 45000
+      });
+
+      try {
+        await page.waitForFunction(
+          targetSlug => {
+            return Array.from(document.querySelectorAll("a[href*='/releases/']"))
+              .some(a => String(a.href || "").includes(`/releases/${targetSlug}/`));
+          },
+          { timeout: 25000 },
+          slug
+        );
+      } catch {
+        // Continue and inspect whatever rendered.
+      }
+
+      const href = await page.evaluate(targetSlug => {
+        const links = Array.from(document.querySelectorAll("a[href*='/releases/']"))
+          .map(a => String(a.href || ""));
+
+        return links.find(h =>
+          h.includes(`/releases/${targetSlug}/`) &&
+          /\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}([?#]|$)/i.test(h)
+        ) || null;
+      }, slug);
+
+      if (!href) continue;
+
+      const url = new URL(href);
+      url.search = "";
+      url.hash = "";
+
+      const cleanUrl = url.toString();
+
+      headlessReleaseCache[cacheKey] = {
+        ts: Date.now(),
+        url: cleanUrl
+      };
+
+      return cleanUrl;
+    }
+
+    return null;
+  } catch (err) {
+    console.warn(`Headless release lookup failed for ${appName} ${version}: ${err.message}`);
+    return null;
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {
+        // Ignore browser shutdown errors.
+      }
+    }
+  }
+}
+
 async function resolveReleaseUrl(appName, version) {
   const candidates = releaseSvcPaths(appName, version);
 
@@ -1133,9 +1330,14 @@ async function resolveReleaseUrl(appName, version) {
   }
 
   if (appName === "unifiOS") {
+    const exactUrl = await resolveReleaseUrlWithHeadlessBrowser(appName, version);
+    if (exactUrl) return exactUrl;
+
     const v = String(version || "").trim().replace(/\./g, "-");
+
     if (v) {
-      return `https://community.ui.com/releases/UniFi-OS-Dream-Machines-${v}/90241838-309a-45d6-a166-07fdd9d396e7`;
+      const fallbackSlug = unifiOsReleaseTitleSlugs(version)[0] || `UniFi-OS-Dream-Machines-${v}`;
+      return `https://community.ui.com/releases?q=${encodeURIComponent(fallbackSlug)}`;
     }
   }
 
