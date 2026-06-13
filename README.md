@@ -113,19 +113,18 @@ https://hub.docker.com/r/scottibyte/unifi-statistics
 
 ---
 
-## GitHub Repository
+# 🌐 Community
 
-https://github.com/ScottiBYTE/unifi-statistics
+## Community Support
 
----
+Need help with Unifi Statistics, Docker deployment, Incus profile management, container creation, or ScottiBYTE utilities?
 
-## License
+Join the ScottiBYTE Rocket.Chat community:
 
-MIT License
+[Join ScottiBYTE Rocket.Chat](https://go.rocket.chat/invite?host=chat.scottibyte.com&path=invite%2FaCh2oW)
 
----
+New users can start in `#general`. From there, you can find other ScottiBYTE project channels and community discussions.
 
-## Author
-
-Developed by ScottiBYTE  
-https://www.scottibyte.com
+For bugs and feature requests, please continue to use GitHub Issues.
+For quick questions and community discussion, use Rocket.Chat.
+```
