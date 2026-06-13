@@ -20,3 +20,7 @@ node_modules/
 # Backups created by patches
 *.before-*
 server.js.before-*
+server.js.bak-*
+README.md.bak-*
+.gitignore.bak-*
+data/releaseUrlCache.json

@@ -62,6 +62,7 @@ const DATA_DIR = "./data";
 const CLIENT_DB_FILE = path.join(DATA_DIR, "clients.json");
 const BASELINE_FILE = path.join(DATA_DIR, "baseline.json");
 const APP_VERSIONS_FILE = path.join(DATA_DIR, "appVersions.json");
+const RELEASE_URL_CACHE_FILE = path.join(DATA_DIR, "releaseUrlCache.json");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const OFFLINE_GRACE_MS = 90 * 1000;
@@ -143,64 +144,157 @@ const client = axios.create({
 
 // ---------- AUTH ----------
 
-async function login() {
-  const response = await client.post("/api/auth/login", {
-    username: config.username,
-    password: config.password
-  });
+const AUTH_SESSION_MAX_AGE_MS = Number(process.env.UNIFI_SESSION_MAX_AGE_MS || (20 * 60 * 1000));
+const AUTH_MIN_LOGIN_GAP_MS = Number(process.env.UNIFI_MIN_LOGIN_GAP_MS || 15000);
+const AUTH_RATE_LIMIT_BACKOFF_MS = Number(process.env.UNIFI_RATE_LIMIT_BACKOFF_MS || (2 * 60 * 1000));
+const UNIFI_REQUEST_TIMEOUT_MS = Number(process.env.UNIFI_REQUEST_TIMEOUT_MS || 15000);
 
-  if (!response.headers["set-cookie"]) {
-    throw new Error(`Login failed: ${response.status}`);
-  }
+let authSession = {
+  createdAt: 0,
+  rateLimitedUntil: 0,
+  lastLoginStatus: null,
+  lastLoginMessage: ""
+};
 
-  cookie = response.headers["set-cookie"].join("; ");
+function sessionIsValid() {
+  return !!cookie && Date.now() - authSession.createdAt < AUTH_SESSION_MAX_AGE_MS;
 }
 
-async function unifiGet(apiPath) {
-  if (!cookie) await login();
-
-  let response = await client.get(apiPath, {
-    headers: { Cookie: cookie }
-  });
-
-  if (response.status === 401 || response.status === 403) {
-    cookie = "";
-    await login();
-
-    response = await client.get(apiPath, {
-      headers: { Cookie: cookie }
-    });
-  }
-
-  if (response.status >= 400) {
-    throw new Error(`UniFi API error ${response.status} on ${apiPath}`);
-  }
-
-  return response.data;
+function cleanCookieHeader(setCookieHeaders) {
+  return (setCookieHeaders || [])
+    .map(c => String(c).split(";")[0])
+    .filter(Boolean)
+    .join("; ");
 }
 
-async function unifiTry(apiPath) {
+function clearUnifiSession() {
+  cookie = "";
+  authSession.createdAt = 0;
+}
+
+function rateLimitSecondsRemaining() {
+  return Math.max(1, Math.ceil((authSession.rateLimitedUntil - Date.now()) / 1000));
+}
+
+async function login(force = false) {
+  if (!force && sessionIsValid()) {
+    return cookie;
+  }
+
+  if (loginInProgress) {
+    return loginInProgress;
+  }
+
+  loginInProgress = (async () => {
+    const now = Date.now();
+
+    if (authSession.rateLimitedUntil && authSession.rateLimitedUntil > now) {
+      throw new Error(`Login temporarily rate limited by UniFi. Retry in ${rateLimitSecondsRemaining()} seconds.`);
+    }
+
+    const sinceLastLogin = now - lastLoginAttempt;
+    if (sinceLastLogin < AUTH_MIN_LOGIN_GAP_MS) {
+      await sleep(AUTH_MIN_LOGIN_GAP_MS - sinceLastLogin);
+    }
+
+    lastLoginAttempt = Date.now();
+
+    const response = await client.post(
+      "/api/auth/login",
+      {
+        username: config.username,
+        password: config.password,
+        remember: false
+      },
+      {
+        timeout: UNIFI_REQUEST_TIMEOUT_MS
+      }
+    );
+
+    authSession.lastLoginStatus = response.status;
+
+    if (response.status === 429) {
+      authSession.rateLimitedUntil = Date.now() + AUTH_RATE_LIMIT_BACKOFF_MS;
+      authSession.lastLoginMessage = "Login failed: 429 rate limited.";
+      throw new Error(`Login failed: 429 rate limited. Backing off for ${Math.round(AUTH_RATE_LIMIT_BACKOFF_MS / 1000)} seconds.`);
+    }
+
+    const cookieHeader = cleanCookieHeader(response.headers["set-cookie"]);
+
+    if (response.status < 200 || response.status >= 300 || !cookieHeader) {
+      authSession.lastLoginMessage = `Login failed: ${response.status}`;
+      throw new Error(`Login failed: ${response.status}`);
+    }
+
+    cookie = cookieHeader;
+    authSession.createdAt = Date.now();
+    authSession.rateLimitedUntil = 0;
+    authSession.lastLoginMessage = "Login succeeded.";
+
+    return cookie;
+  })();
+
   try {
-    if (!cookie) await login();
+    return await loginInProgress;
+  } finally {
+    loginInProgress = null;
+  }
+}
 
-    let response = await client.get(apiPath, {
-      headers: { Cookie: cookie }
+async function unifiRequest(method, apiPath, options = {}) {
+  const optional = options.optional === true;
+  const retry = options.retry !== false;
+
+  try {
+    const cookieHeader = await login(false);
+
+    let response = await client.request({
+      method,
+      url: apiPath,
+      headers: { Cookie: cookieHeader },
+      timeout: UNIFI_REQUEST_TIMEOUT_MS
     });
 
-    if (response.status === 401 || response.status === 403) {
-      cookie = "";
-      await login();
+    if ((response.status === 401 || response.status === 403) && retry) {
+      clearUnifiSession();
 
-      response = await client.get(apiPath, {
-        headers: { Cookie: cookie }
+      const freshCookieHeader = await login(true);
+
+      response = await client.request({
+        method,
+        url: apiPath,
+        headers: { Cookie: freshCookieHeader },
+        timeout: UNIFI_REQUEST_TIMEOUT_MS
       });
     }
 
-    if (response.status >= 400) return null;
+    if (response.status === 429) {
+      authSession.rateLimitedUntil = Date.now() + AUTH_RATE_LIMIT_BACKOFF_MS;
+
+      if (optional) return null;
+
+      throw new Error(`UniFi API rate limited: 429 on ${apiPath}`);
+    }
+
+    if (response.status >= 400) {
+      if (optional) return null;
+
+      throw new Error(`UniFi API error ${response.status} on ${apiPath}`);
+    }
+
     return response.data;
-  } catch {
-    return null;
+  } catch (err) {
+    if (optional) return null;
+    throw err;
   }
+}
+
+async function unifiGet(apiPath) {
+  return unifiRequest("get", apiPath);
+}
+
+async function unifiTry(apiPath) {
+  return unifiRequest("get", apiPath, { optional: true });
 }
 
 // ---------- HELPERS ----------
@@ -1069,38 +1163,106 @@ return {
 
 
 
-function unifiOsReleaseFamilies() {
-  const modelText = [
+
+function releaseVersionDash(version) {
+  return String(version || "")
+    .trim()
+    .replace(/^v/i, "")
+    .replace(/\./g, "-");
+}
+
+function getGatewayModelText() {
+  return [
     appVersionCache?.lastGatewayModel,
     appVersionCache?.lastGatewayName
   ].filter(Boolean).join(" ").toLowerCase();
+}
 
-  if (modelText.includes("udm") || modelText.includes("dream")) {
-    return ["unifi-os/dream-machines", "unifi-os-dream-machines", "dream-machines"];
+function unifiOsReleaseFamily(version) {
+  const vDash = releaseVersionDash(version);
+  const modelText = getGatewayModelText();
+
+  if (!vDash) return null;
+
+  // Hardware-specific UniFi OS release families.
+  // The UUID is different for each family, even when the version number is the same.
+  if (modelText.includes("dream wall") || modelText.includes("udw")) {
+    return {
+      slug: `UniFi-OS-Dream-Wall-${vDash}`,
+      title: `UniFi OS - Dream Wall ${String(version).trim()}`
+    };
   }
 
-  if (modelText.includes("ucg") || modelText.includes("uxg") || modelText.includes("cloud gateway")) {
-    return ["unifi-os/cloud-gateways", "cloud-gateways"];
+  if (
+    modelText.includes("unvr") ||
+    modelText.includes("network video recorder") ||
+    modelText.includes("enterprise network video")
+  ) {
+    return {
+      slug: `UniFi-OS-Enterprise-Network-Video-Recorders-${vDash}`,
+      title: `UniFi OS - Enterprise Network Video Recorders ${String(version).trim()}`
+    };
   }
 
-  if (modelText.includes("uck") || modelText.includes("cloud key")) {
-    return ["unifi-os/cloud-keys", "cloud-keys"];
+  if (
+    modelText.includes("nas") ||
+    modelText.includes("network attached storage")
+  ) {
+    return {
+      slug: `UniFi-OS-Network-Attached-Storage-${vDash}`,
+      title: `UniFi OS - Network Attached Storage ${String(version).trim()}`
+    };
   }
 
-  if (modelText.includes("ux") || modelText.includes("express")) {
-    return ["unifi-os/express", "express"];
+  if (
+    modelText.includes("uck") ||
+    modelText.includes("cloud key")
+  ) {
+    return {
+      slug: `UniFi-OS-Cloud-Keys-${vDash}`,
+      title: `UniFi OS - Cloud Keys ${String(version).trim()}`
+    };
   }
 
-  return [
-    "unifi-os/dream-machines",
-    "unifi-os/cloud-gateways",
-    "unifi-os/cloud-keys",
-    "unifi-os/express",
-    "unifi-os-dream-machines",
-    "cloud-gateways",
-    "cloud-keys",
-    "express"
-  ];
+  if (
+    modelText.includes("ucg") ||
+    modelText.includes("uxg") ||
+    modelText.includes("cloud gateway")
+  ) {
+    return {
+      slug: `UniFi-OS-Cloud-Gateways-${vDash}`,
+      title: `UniFi OS - Cloud Gateways ${String(version).trim()}`
+    };
+  }
+
+  if (
+    modelText.includes("ux") ||
+    modelText.includes("express")
+  ) {
+    return {
+      slug: `UniFi-OS-Express-${vDash}`,
+      title: `UniFi OS - Express ${String(version).trim()}`
+    };
+  }
+
+  // UDM Beast / Dream Machine family.
+  if (
+    modelText.includes("udm") ||
+    modelText.includes("dream") ||
+    modelText.includes("udmea")
+  ) {
+    return {
+      slug: `UniFi-OS-Dream-Machines-${vDash}`,
+      title: `UniFi OS - Dream Machines ${String(version).trim()}`
+    };
+  }
+
+  // Your environment is a Dream Machine-class gateway, so defaulting here is safer
+  // than resolving to a generic UniFi OS page.
+  return {
+    slug: `UniFi-OS-Dream-Machines-${vDash}`,
+    title: `UniFi OS - Dream Machines ${String(version).trim()}`
+  };
 }
 
 function releaseSvcPaths(app, version) {
@@ -1113,67 +1275,23 @@ function releaseSvcPaths(app, version) {
     network: ["network"],
     protect: ["protect"],
     talk: ["talk"],
-    access: ["access"],
-    unifiOS: unifiOsReleaseFamilies()
+    access: ["access"]
   };
 
   return (map[app] || [])
     .map(slug => `https://community.svc.ui.com/releases/${slug}/${encoded}`);
 }
 
-
 const HEADLESS_RELEASE_CACHE_MS = 12 * 60 * 60 * 1000;
 let headlessReleaseCache = {};
 
-
 function unifiOsReleaseTitleSlugs(version) {
-  const vDash = String(version || "")
-    .trim()
-    .replace(/^v/i, "")
-    .replace(/\./g, "-");
-
-  if (!vDash) return [];
-
-  const modelText = [
-    appVersionCache?.lastGatewayModel,
-    appVersionCache?.lastGatewayName
-  ].filter(Boolean).join(" ").toLowerCase();
-
-  if (modelText.includes("uck") || modelText.includes("cloud key")) {
-    return [`UniFi-OS-Cloud-Keys-${vDash}`];
-  }
-
-  if (
-    modelText.includes("ucg") ||
-    modelText.includes("uxg") ||
-    modelText.includes("cloud gateway")
-  ) {
-    return [`UniFi-OS-Cloud-Gateways-${vDash}`];
-  }
-
-  if (modelText.includes("ux") || modelText.includes("express")) {
-    return [`UniFi-OS-Express-${vDash}`];
-  }
-
-  if (modelText.includes("udm") || modelText.includes("dream")) {
-    return [`UniFi-OS-Dream-Machines-${vDash}`];
-  }
-
-  // If the model is unknown, try the common UniFi OS release families.
-  return [
-    `UniFi-OS-Dream-Machines-${vDash}`,
-    `UniFi-OS-Cloud-Gateways-${vDash}`,
-    `UniFi-OS-Cloud-Keys-${vDash}`,
-    `UniFi-OS-Express-${vDash}`
-  ];
+  const family = unifiOsReleaseFamily(version);
+  return family ? [family.slug] : [];
 }
 
 function browserReleaseTitleSlug(appName, version) {
-  const vDash = String(version || "")
-    .trim()
-    .replace(/^v/i, "")
-    .replace(/\./g, "-");
-
+  const vDash = releaseVersionDash(version);
   if (!vDash) return "";
 
   if (appName === "unifiOS") {
@@ -1211,20 +1329,64 @@ function chromiumExecutablePath() {
   return candidates[0] || "/usr/bin/chromium-browser";
 }
 
+function normalizeReleaseText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function canonicalReleaseUrl(rawHref, slug) {
+  if (!rawHref || !slug) return null;
+
+  let url;
+  try {
+    url = new URL(rawHref, "https://community.ui.com");
+  } catch {
+    return null;
+  }
+
+  if (url.hash && url.hash.includes("comment")) return null;
+
+  const uuidMatch = url.pathname.match(/\/releases\/(?:[^/]+\/)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  if (!uuidMatch) return null;
+
+  return `https://community.ui.com/releases/${slug}/${uuidMatch[1]}`;
+}
+
 async function resolveReleaseUrlWithHeadlessBrowser(appName, version) {
   if (!puppeteer) return null;
 
-  const slugs = appName === "unifiOS"
-    ? unifiOsReleaseTitleSlugs(version)
-    : [browserReleaseTitleSlug(appName, version)].filter(Boolean);
-
-  if (!slugs.length) return null;
-
-  const cacheKey = `${appName}:${String(version || "").trim()}`;
+  const cacheKey = `${appName}:${String(version || "").trim()}:${getGatewayModelText()}`;
   const cached = headlessReleaseCache[cacheKey];
 
   if (cached && Date.now() - cached.ts < HEADLESS_RELEASE_CACHE_MS) {
     return cached.url;
+  }
+
+  let targets = [];
+
+  if (appName === "unifiOS") {
+    const family = unifiOsReleaseFamily(version);
+    if (!family) return null;
+    targets = [family];
+  } else {
+    const slug = browserReleaseTitleSlug(appName, version);
+    if (!slug) return null;
+
+    const titleMap = {
+      network: `UniFi Network Application ${String(version).trim()}`,
+      protect: `UniFi Protect Application ${String(version).trim()}`,
+      talk: `UniFi Talk Application ${String(version).trim()}`,
+      access: `UniFi Access Application ${String(version).trim()}`
+    };
+
+    targets = [{
+      slug,
+      title: titleMap[appName] || slug.replace(/-/g, " ")
+    }];
   }
 
   let browser = null;
@@ -1243,57 +1405,97 @@ async function resolveReleaseUrlWithHeadlessBrowser(appName, version) {
     });
 
     const page = await browser.newPage();
+    await page.setViewport({ width: 1600, height: 1000 });
 
     await page.setUserAgent(
       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 " +
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     );
 
-    for (const slug of slugs) {
-      const searchUrl = `https://community.ui.com/releases?q=${encodeURIComponent(slug)}`;
+    for (const target of targets) {
+      const expectedNormalized = normalizeReleaseText(target.title);
 
-      await page.goto(searchUrl, {
+      await page.goto("https://community.ui.com/releases", {
         waitUntil: "networkidle2",
         timeout: 45000
       });
 
-      try {
-        await page.waitForFunction(
-          targetSlug => {
-            return Array.from(document.querySelectorAll("a[href*='/releases/']"))
-              .some(a => String(a.href || "").includes(`/releases/${targetSlug}/`));
-          },
-          { timeout: 25000 },
-          slug
+      await new Promise(resolve => setTimeout(resolve, 4000));
+
+      await page.focus("input[type='search']");
+      await page.keyboard.down("Control");
+      await page.keyboard.press("A");
+      await page.keyboard.up("Control");
+      await page.keyboard.press("Backspace");
+      await page.keyboard.type(target.title, { delay: 35 });
+
+      await new Promise(resolve => setTimeout(resolve, 12000));
+
+      const href = await page.evaluate(expectedNormalized => {
+        const normalize = value => String(value || "")
+          .toLowerCase()
+          .replace(/&/g, " and ")
+          .replace(/[^a-z0-9]+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        const uuidRelease = href =>
+          /\/releases\/(?:[^/]+\/)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(href || "").split("#")[0]);
+
+        const candidates = Array.from(document.querySelectorAll("a[href*='/releases/']"))
+          .map(a => {
+            const card = a.closest("article, li, section, div");
+            const ownText = [
+              a.innerText,
+              a.textContent,
+              a.getAttribute("aria-label"),
+              a.getAttribute("title")
+            ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+
+            const cardText = card
+              ? String(card.innerText || "").replace(/\s+/g, " ").trim()
+              : "";
+
+            return {
+              href: String(a.href || "").split("#")[0],
+              normalizedOwnText: normalize(ownText),
+              normalizedCardText: normalize(cardText)
+            };
+          })
+          .filter(item =>
+            item.href &&
+            !item.href.includes("#comment") &&
+            uuidRelease(item.href)
+          );
+
+        let exact = candidates.find(item =>
+          item.normalizedOwnText === expectedNormalized ||
+          item.normalizedOwnText.startsWith(`${expectedNormalized} `) ||
+          item.normalizedCardText === expectedNormalized ||
+          item.normalizedCardText.startsWith(`${expectedNormalized} `)
         );
-      } catch {
-        // Continue and inspect whatever rendered.
+
+        if (exact) return exact.href;
+
+        exact = candidates.find(item =>
+          item.normalizedCardText.includes(expectedNormalized)
+        );
+
+        return exact ? exact.href : null;
+      }, expectedNormalized);
+
+      const cleanUrl = canonicalReleaseUrl(href, target.slug);
+
+      if (cleanUrl) {
+        console.log(`Resolved ${appName} ${version} release URL: ${cleanUrl}`);
+
+        headlessReleaseCache[cacheKey] = {
+          ts: Date.now(),
+          url: cleanUrl
+        };
+
+        return cleanUrl;
       }
-
-      const href = await page.evaluate(targetSlug => {
-        const links = Array.from(document.querySelectorAll("a[href*='/releases/']"))
-          .map(a => String(a.href || ""));
-
-        return links.find(h =>
-          h.includes(`/releases/${targetSlug}/`) &&
-          /\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}([?#]|$)/i.test(h)
-        ) || null;
-      }, slug);
-
-      if (!href) continue;
-
-      const url = new URL(href);
-      url.search = "";
-      url.hash = "";
-
-      const cleanUrl = url.toString();
-
-      headlessReleaseCache[cacheKey] = {
-        ts: Date.now(),
-        url: cleanUrl
-      };
-
-      return cleanUrl;
     }
 
     return null;
@@ -1311,7 +1513,75 @@ async function resolveReleaseUrlWithHeadlessBrowser(appName, version) {
   }
 }
 
+function loadReleaseUrlCache() {
+  try {
+    if (!fs.existsSync(RELEASE_URL_CACHE_FILE)) return {};
+    return JSON.parse(fs.readFileSync(RELEASE_URL_CACHE_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveReleaseUrlCache(cache) {
+  try {
+    fs.writeFileSync(RELEASE_URL_CACHE_FILE, JSON.stringify(cache, null, 2));
+  } catch {
+    // Ignore cache write failures.
+  }
+}
+
+function releaseCacheKeys(appName, version) {
+  const v = String(version || "").trim();
+
+  if (appName === "unifiOS") {
+    const family = unifiOsReleaseFamily(version);
+    return [
+      `${appName}:${v}:${family?.slug || ""}`,
+      `${appName}:${v}`
+    ];
+  }
+
+  return [`${appName}:${v}`];
+}
+
+function getCachedReleaseUrl(appName, version) {
+  const cache = loadReleaseUrlCache();
+
+  for (const key of releaseCacheKeys(appName, version)) {
+    const entry = cache[key];
+
+    if (typeof entry === "string" && entry.includes("community.ui.com/releases")) {
+      return entry;
+    }
+
+    if (entry?.url && entry.url.includes("community.ui.com/releases")) {
+      return entry.url;
+    }
+  }
+
+  return null;
+}
+
+function putCachedReleaseUrl(appName, version, url) {
+  if (!url || !url.includes("community.ui.com/releases")) return;
+
+  const cache = loadReleaseUrlCache();
+  const keys = releaseCacheKeys(appName, version);
+
+  for (const key of keys) {
+    cache[key] = {
+      url,
+      ts: Date.now()
+    };
+  }
+
+  saveReleaseUrlCache(cache);
+}
+
 async function resolveReleaseUrl(appName, version) {
+  const cachedUrl = getCachedReleaseUrl(appName, version);
+  if (cachedUrl) return cachedUrl;
+
   const candidates = releaseSvcPaths(appName, version);
 
   for (const svcUrl of candidates) {
@@ -1322,6 +1592,7 @@ async function resolveReleaseUrl(appName, version) {
       });
 
       if (response.data?.url && response.data.url.includes("community.ui.com/releases")) {
+        putCachedReleaseUrl(appName, version, response.data.url);
         return response.data.url;
       }
     } catch {
@@ -1329,21 +1600,21 @@ async function resolveReleaseUrl(appName, version) {
     }
   }
 
+  const exactUrl = await resolveReleaseUrlWithHeadlessBrowser(appName, version);
+  if (exactUrl) {
+    putCachedReleaseUrl(appName, version, exactUrl);
+    return exactUrl;
+  }
+
   if (appName === "unifiOS") {
-    const exactUrl = await resolveReleaseUrlWithHeadlessBrowser(appName, version);
-    if (exactUrl) return exactUrl;
-
-    const v = String(version || "").trim().replace(/\./g, "-");
-
-    if (v) {
-      const fallbackSlug = unifiOsReleaseTitleSlugs(version)[0] || `UniFi-OS-Dream-Machines-${v}`;
-      return `https://community.ui.com/releases?q=${encodeURIComponent(fallbackSlug)}`;
+    const family = unifiOsReleaseFamily(version);
+    if (family) {
+      return `https://community.ui.com/releases?q=${encodeURIComponent(family.title)}`;
     }
   }
 
   return null;
 }
-
 
 // ---------- ROUTES ----------
 
