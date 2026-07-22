@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <title>UniFi Statistics</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
@@ -1233,11 +1235,11 @@ body.light .empty {
 </span>
 
       <span class="app-links" id="appLinks">
-        <a class="header-link" id="githubLink" href="https://github.com/ScottiBYTE/unifi-statistics" target="_blank" rel="noopener">GitHub <span id="appVersion">v2.1.2</span></a>
+        <a class="header-link" id="githubLink" href="https://github.com/ScottiBYTE/unifi-statistics" target="_blank" rel="noopener">GitHub <span id="appVersion">v2.2.0</span></a>
         <a class="header-link" id="donateLink" href="https://www.paypal.com/paypalme/ScottiBYTE" target="_blank" rel="noopener">❤️ Donate</a>
         <button id="themeToggle" class="theme-button" type="button">☀ Light</button>
       </span>
-      <button class="refresh-button" onclick="loadStats()">Refresh</button>
+      <button class="refresh-button" onclick="loadStats(true)">Refresh</button>
       <button id="clearBaselineButton" class="danger-button" onclick="clearBaseline()">Clear Baseline</button>
     </div>
   </div>
@@ -1832,12 +1834,18 @@ async function clearBaseline() {
   await loadStats();
 }
 
-async function loadStats() {
+async function loadStats(forceAppRefresh = false) {
   const status = document.getElementById("status");
   status.textContent = "Refreshing...";
 
   try {
-    const res = await fetch("/api/summary");
+    const summaryUrl = forceAppRefresh
+      ? "/api/summary?refreshApps=1"
+      : "/api/summary";
+
+    const res = await fetch(summaryUrl, {
+      cache: "no-store"
+    });
     const data = await res.json();
 
     if (!res.ok) {

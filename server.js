@@ -624,10 +624,13 @@ function normalizeAppVersions(result) {
   };
 }
 
-async function getAppVersions() {
+async function getAppVersions(forceRefresh = false) {
   const now = Date.now();
 
-  if (now - appVersionCache.ts < APP_VERSION_CACHE_MS) {
+  if (
+    !forceRefresh &&
+    now - appVersionCache.ts < APP_VERSION_CACHE_MS
+  ) {
     return appVersionCache.data;
   }
 
@@ -673,6 +676,21 @@ async function getAppVersions() {
 
   const systemPayload = probes[0];
 
+  try {
+    fs.writeFileSync(
+      path.join(DATA_DIR, "unifiOsFirmwareDebug.json"),
+      JSON.stringify({
+        firmwareVersion: systemPayload?.firmwareVersion ?? null,
+        releaseChannel: systemPayload?.firmware?.releaseChannel ?? null,
+        latest: systemPayload?.firmware?.latest ?? null,
+        latestByChannel: systemPayload?.firmware?.latestByChannel ?? null,
+        latestUpdate: systemPayload?.latestUpdate ?? null
+      }, null, 2)
+    );
+  } catch (error) {
+    console.error("Unable to write UniFi OS firmware diagnostic:", error.message);
+  }
+
   if (
     systemPayload?.firmware &&
     typeof systemPayload.firmware === "object"
@@ -681,36 +699,6 @@ async function getAppVersions() {
 
     if (typeof osChannel === "string" && osChannel.trim()) {
       result.channels.unifiOS = osChannel.trim();
-    }
-
-    const latestOsFirmware = systemPayload.firmware.latest;
-
-    if (
-      latestOsFirmware &&
-      typeof latestOsFirmware === "object" &&
-      looksLikeVersion(latestOsFirmware.version)
-    ) {
-      const availableVersion = String(latestOsFirmware.version)
-        .trim()
-        .replace(/^v/i, "")
-        .split("+")[0];
-
-      const installedVersion = String(
-        result.versions.unifiOS ||
-        systemPayload.firmwareVersion ||
-        ""
-      )
-        .trim()
-        .replace(/^v/i, "")
-        .split("+")[0];
-
-      if (
-        installedVersion &&
-        availableVersion &&
-        installedVersion !== availableVersion
-      ) {
-        result.updates.unifiOS = availableVersion;
-      }
     }
   }
 
@@ -764,6 +752,49 @@ async function getAppVersions() {
     result.channels.access = result.channels.access || access.channel;
   }
 
+  // Compare the selected UniFi OS channel's latest firmware only after
+  // the installed UniFi OS version has been discovered by the probes.
+  if (
+    systemPayload?.firmware &&
+    typeof systemPayload.firmware === "object"
+  ) {
+    const selectedOsChannel =
+      typeof systemPayload.firmware.releaseChannel === "string"
+        ? systemPayload.firmware.releaseChannel.trim()
+        : "";
+
+    const latestOsFirmware =
+      systemPayload.firmware.latestByChannel?.[selectedOsChannel] ||
+      systemPayload.firmware.latest;
+
+    const availableVersion = String(latestOsFirmware?.version || "")
+      .trim()
+      .replace(/^v/i, "")
+      .split("+")[0];
+
+    if (
+      latestOsFirmware &&
+      typeof latestOsFirmware === "object" &&
+      looksLikeVersion(availableVersion)
+    ) {
+
+      const installedVersion = String(result.versions.unifiOS || "")
+        .trim()
+        .replace(/^v/i, "")
+        .split("+")[0];
+
+      if (
+        installedVersion &&
+        availableVersion &&
+        installedVersion !== availableVersion
+      ) {
+        result.updates.unifiOS = availableVersion;
+      } else {
+        result.updates.unifiOS = null;
+      }
+    }
+  }
+
   let normalized = normalizeAppVersions(result);
 
   let saved = null;
@@ -783,14 +814,6 @@ async function getAppVersions() {
     for (const key of Object.keys(normalized.versions)) {
       if (!normalized.versions[key] && saved.versions[key]) {
         normalized.versions[key] = saved.versions[key];
-      }
-    }
-  }
-
-  if (saved?.updates) {
-    for (const key of Object.keys(normalized.updates)) {
-      if (!normalized.updates[key] && saved.updates[key]) {
-        normalized.updates[key] = saved.updates[key];
       }
     }
   }
@@ -1160,14 +1183,14 @@ function getAlerts(summary, internetHealth, apUtilization, recentlyOffline) {
 
 // ---------- MAIN COLLECTION ----------
 
-async function collectStats() {
+async function collectStats(forceAppRefresh = false) {
   const site = config.site || "default";
 
   const [devices, clients, health, appInfo] = await Promise.all([
     unifiGet(`/proxy/network/api/s/${site}/stat/device`),
     unifiGet(`/proxy/network/api/s/${site}/stat/sta`),
     unifiGet(`/proxy/network/api/s/${site}/stat/health`),
-    getAppVersions()
+    getAppVersions(forceAppRefresh)
   ]);
 
   const deviceList = devices.data || [];
@@ -1252,7 +1275,7 @@ if (!appInfo.versions.access) {
 
 for (const key of Object.keys(appInfo.updates)) {
   if (!appInfo.versions[key]) {
-    appInfo.updates[key] = false;
+    appInfo.updates[key] = null;
   }
 }
 
@@ -1570,14 +1593,178 @@ async function resolveReleaseUrlWithHeadlessBrowser(appName, version) {
 
       await new Promise(resolve => setTimeout(resolve, 4000));
 
-      await page.focus("input[type='search']");
-      await page.keyboard.down("Control");
-      await page.keyboard.press("A");
-      await page.keyboard.up("Control");
+      // Enable every release channel by locating its visible text and then
+      // walking upward to the row containing the associated hidden checkbox.
+      await page.evaluate(() => {
+        const normalize = value => String(value || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+
+        const desiredChannels = [
+          "official release",
+          "release candidate",
+          "early access"
+        ];
+
+        for (const channelName of desiredChannels) {
+          const textElement = Array.from(
+            document.querySelectorAll("body *")
+          ).find(element => {
+            if (element.children.length > 0) return false;
+            return normalize(element.textContent) === channelName;
+          });
+
+          if (!textElement) continue;
+
+          let row = textElement;
+
+          for (let depth = 0; depth < 10 && row; depth += 1) {
+            const checkbox = row.querySelector?.(
+              "input[type='checkbox'], [role='checkbox']"
+            );
+
+            if (checkbox) {
+              const checked =
+                checkbox.checked === true ||
+                checkbox.getAttribute("aria-checked") === "true";
+
+              if (!checked) {
+                if (checkbox.matches("input[type='checkbox']")) {
+                  checkbox.click();
+
+                  if (!checkbox.checked) {
+                    checkbox.checked = true;
+                    checkbox.dispatchEvent(
+                      new Event("input", { bubbles: true })
+                    );
+                    checkbox.dispatchEvent(
+                      new Event("change", { bubbles: true })
+                    );
+                  }
+                } else {
+                  checkbox.click();
+                }
+              }
+
+              break;
+            }
+
+            row = row.parentElement;
+          }
+        }
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // Use the releases-page keyword filter, not the global site search.
+      const searchSelector = "input[placeholder='Filter by keyword']";
+
+      await page.waitForSelector(searchSelector, {
+        visible: true,
+        timeout: 15000
+      });
+
+      await page.click(searchSelector, { clickCount: 3 });
       await page.keyboard.press("Backspace");
       await page.keyboard.type(target.title, { delay: 35 });
 
       await new Promise(resolve => setTimeout(resolve, 12000));
+
+      if (appName === "unifiOS") {
+        try {
+          const diagnostic = await page.evaluate(() => {
+            const clean = value => String(value || "")
+              .replace(/\\s+/g, " ")
+              .trim();
+
+            const controls = Array.from(
+              document.querySelectorAll(
+                "label, button, input, [role='checkbox'], [role='radio'], [role='switch']"
+              )
+            ).map((element, index) => ({
+              index,
+              tag: element.tagName,
+              type: element.getAttribute("type"),
+              role: element.getAttribute("role"),
+              text: clean(
+                element.innerText ||
+                element.textContent ||
+                element.getAttribute("aria-label") ||
+                element.getAttribute("title")
+              ),
+              checked:
+                typeof element.checked === "boolean"
+                  ? element.checked
+                  : null,
+              ariaChecked: element.getAttribute("aria-checked"),
+              id: element.id || null,
+              htmlFor: element.getAttribute("for"),
+              visible: Boolean(
+                element.offsetWidth ||
+                element.offsetHeight ||
+                element.getClientRects().length
+              )
+            })).filter(item =>
+              item.visible ||
+              /official|candidate|early|access|release/i.test(item.text)
+            );
+
+            const releaseLinks = Array.from(
+              document.querySelectorAll("a[href*='/releases/']")
+            ).map(a => ({
+              href: String(a.href || "").split("#")[0],
+              text: clean(
+                a.innerText ||
+                a.textContent ||
+                a.getAttribute("aria-label") ||
+                a.getAttribute("title")
+              )
+            })).filter(item => item.href);
+
+            const searchInputs = Array.from(
+              document.querySelectorAll("input")
+            ).map(input => ({
+              type: input.type || null,
+              placeholder: input.placeholder || null,
+              ariaLabel: input.getAttribute("aria-label"),
+              value: input.value || null,
+              visible: Boolean(
+                input.offsetWidth ||
+                input.offsetHeight ||
+                input.getClientRects().length
+              )
+            }));
+
+            return {
+              url: location.href,
+              title: document.title,
+              controls,
+              searchInputs,
+              releaseLinks
+            };
+          });
+
+          fs.writeFileSync(
+            path.join(DATA_DIR, "releasePageDebug.json"),
+            JSON.stringify({
+              appName,
+              version,
+              target,
+              diagnostic
+            }, null, 2)
+          );
+
+          await page.screenshot({
+            path: path.join(DATA_DIR, "releasePageDebug.png"),
+            fullPage: true
+          });
+        } catch (error) {
+          console.warn(
+            `Unable to write release-page diagnostic: ${error.message}`
+          );
+        }
+      }
 
       const href = await page.evaluate(expectedNormalized => {
         const normalize = value => String(value || "")
@@ -1692,6 +1879,63 @@ function releaseCacheKeys(appName, version) {
   return [`${appName}:${v}`];
 }
 
+function loadReleaseUrlOverrides() {
+  try {
+    const overrideFile = path.join(
+      DATA_DIR,
+      "releaseUrlOverrides.json"
+    );
+
+    if (!fs.existsSync(overrideFile)) {
+      return {};
+    }
+
+    const parsed = JSON.parse(
+      fs.readFileSync(overrideFile, "utf8")
+    );
+
+    return parsed && typeof parsed === "object"
+      ? parsed
+      : {};
+  } catch (error) {
+    console.warn(
+      `Unable to load release URL overrides: ${error.message}`
+    );
+
+    return {};
+  }
+}
+
+function getReleaseUrlOverride(appName, version) {
+  const overrides = loadReleaseUrlOverrides();
+
+  for (const key of releaseCacheKeys(appName, version)) {
+    const url = overrides[key];
+
+    if (typeof url !== "string") {
+      continue;
+    }
+
+    if (appName === "unifiOS") {
+      const family = unifiOsReleaseFamily(version);
+
+      if (family && canonicalReleaseUrl(url, family.slug)) {
+        return url;
+      }
+
+      continue;
+    }
+
+    if (
+      /https:\/\/community\.ui\.com\/releases\//i.test(url)
+    ) {
+      return url;
+    }
+  }
+
+  return null;
+}
+
 function getCachedReleaseUrl(appName, version) {
   const cache = loadReleaseUrlCache();
 
@@ -1727,6 +1971,13 @@ function putCachedReleaseUrl(appName, version, url) {
 }
 
 async function resolveReleaseUrl(appName, version) {
+  const overrideUrl = getReleaseUrlOverride(appName, version);
+
+  if (overrideUrl) {
+    putCachedReleaseUrl(appName, version, overrideUrl);
+    return overrideUrl;
+  }
+
   const cachedUrl = getCachedReleaseUrl(appName, version);
   if (cachedUrl) return cachedUrl;
 
@@ -1801,7 +2052,11 @@ app.get("/api/release-link", async (req, res) => {
 
 app.get("/api/summary", async (req, res) => {
   try {
-    const data = await collectStats();
+    const forceAppRefresh =
+      req.query.refreshApps === "1" ||
+      req.query.refreshApps === "true";
+
+    const data = await collectStats(forceAppRefresh);
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1810,7 +2065,11 @@ app.get("/api/summary", async (req, res) => {
 
 app.get("/api/app-versions", async (req, res) => {
   try {
-    const data = await getAppVersions();
+    const forceRefresh =
+      req.query.refresh === "1" ||
+      req.query.refresh === "true";
+
+    const data = await getAppVersions(forceRefresh);
     res.json(data);
   } catch (err) {
     res.status(500).json({ error: err.message });
