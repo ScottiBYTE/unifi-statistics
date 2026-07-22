@@ -9,6 +9,7 @@ RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefo
 
 COPY server.js ./
 COPY public ./public
+COPY data/releaseUrlOverrides.json ./data/releaseUrlOverrides.json
 
 EXPOSE 3050
 
