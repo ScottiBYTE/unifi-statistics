@@ -515,12 +515,45 @@ function findFirstVersion(payload, keys) {
   return found;
 }
 
+function firstVersionField(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+
+    if (looksLikeVersion(value)) {
+      return String(value);
+    }
+
+    if (value && typeof value === "object") {
+      for (const nestedValue of Object.values(value)) {
+        if (looksLikeVersion(nestedValue)) {
+          return String(nestedValue);
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function firstStringField(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
 function findAppInfo(payload, aliases) {
   const aliasList = aliases.map(a => a.toLowerCase());
 
-  let best = {
+  const best = {
     version: null,
-    update: false
+    update: null,
+    channel: null
   };
 
   walkObjects(payload, obj => {
@@ -531,7 +564,29 @@ function findAppInfo(payload, aliases) {
     if (!matched) return;
 
     const version = pickVersionFromObject(obj);
+
+    const update = firstVersionField(obj, [
+      "updateAvailable",
+      "update_available",
+      "availableVersion",
+      "available_version",
+      "latestAvailableVersion",
+      "latest_available_version",
+      "latestVersion",
+      "latest_version"
+    ]);
+
+    const channel = firstStringField(obj, [
+      "releaseChannel",
+      "release_channel",
+      "updateChannel",
+      "update_channel",
+      "channel"
+    ]);
+
     if (version && !best.version) best.version = version;
+    if (update && !best.update) best.update = update;
+    if (channel && !best.channel) best.channel = channel;
   });
 
   return best;
@@ -546,15 +601,26 @@ function normalizeAppVersions(result) {
     access: result?.versions?.access || null
   };
 
+  const updates = {
+    unifiOS: result?.updates?.unifiOS || null,
+    network: result?.updates?.network || null,
+    protect: result?.updates?.protect || null,
+    talk: result?.updates?.talk || null,
+    access: result?.updates?.access || null
+  };
+
+  const channels = {
+    unifiOS: result?.channels?.unifiOS || null,
+    network: result?.channels?.network || null,
+    protect: result?.channels?.protect || null,
+    talk: result?.channels?.talk || null,
+    access: result?.channels?.access || null
+  };
+
   return {
     versions,
-    updates: {
-      unifiOS: false,
-      network: false,
-      protect: false,
-      talk: false,
-      access: false
-    }
+    updates,
+    channels
   };
 }
 
@@ -574,11 +640,18 @@ async function getAppVersions() {
       access: null
     },
     updates: {
-      unifiOS: false,
-      network: false,
-      protect: false,
-      talk: false,
-      access: false
+      unifiOS: null,
+      network: null,
+      protect: null,
+      talk: null,
+      access: null
+    },
+    channels: {
+      unifiOS: null,
+      network: null,
+      protect: null,
+      talk: null,
+      access: null
     }
   };
 
@@ -596,6 +669,50 @@ async function getAppVersions() {
     unifiTry("/proxy/talk/api/bootstrap"),
     unifiTry("/proxy/access/api/bootstrap")
   ]);
+
+
+  const systemPayload = probes[0];
+
+  if (
+    systemPayload?.firmware &&
+    typeof systemPayload.firmware === "object"
+  ) {
+    const osChannel = systemPayload.firmware.releaseChannel;
+
+    if (typeof osChannel === "string" && osChannel.trim()) {
+      result.channels.unifiOS = osChannel.trim();
+    }
+
+    const latestOsFirmware = systemPayload.firmware.latest;
+
+    if (
+      latestOsFirmware &&
+      typeof latestOsFirmware === "object" &&
+      looksLikeVersion(latestOsFirmware.version)
+    ) {
+      const availableVersion = String(latestOsFirmware.version)
+        .trim()
+        .replace(/^v/i, "")
+        .split("+")[0];
+
+      const installedVersion = String(
+        result.versions.unifiOS ||
+        systemPayload.firmwareVersion ||
+        ""
+      )
+        .trim()
+        .replace(/^v/i, "")
+        .split("+")[0];
+
+      if (
+        installedVersion &&
+        availableVersion &&
+        installedVersion !== availableVersion
+      ) {
+        result.updates.unifiOS = availableVersion;
+      }
+    }
+  }
 
   for (const payload of probes.filter(Boolean)) {
     result.versions.unifiOS =
@@ -633,6 +750,18 @@ async function getAppVersions() {
     result.versions.protect = result.versions.protect || protect.version;
     result.versions.talk = result.versions.talk || talk.version;
     result.versions.access = result.versions.access || access.version;
+
+    result.updates.unifiOS = result.updates.unifiOS || os.update;
+    result.updates.network = result.updates.network || network.update;
+    result.updates.protect = result.updates.protect || protect.update;
+    result.updates.talk = result.updates.talk || talk.update;
+    result.updates.access = result.updates.access || access.update;
+
+    result.channels.unifiOS = result.channels.unifiOS || os.channel;
+    result.channels.network = result.channels.network || network.channel;
+    result.channels.protect = result.channels.protect || protect.channel;
+    result.channels.talk = result.channels.talk || talk.channel;
+    result.channels.access = result.channels.access || access.channel;
   }
 
   let normalized = normalizeAppVersions(result);
@@ -658,9 +787,26 @@ async function getAppVersions() {
     }
   }
 
+  if (saved?.updates) {
+    for (const key of Object.keys(normalized.updates)) {
+      if (!normalized.updates[key] && saved.updates[key]) {
+        normalized.updates[key] = saved.updates[key];
+      }
+    }
+  }
+
+  if (saved?.channels) {
+    for (const key of Object.keys(normalized.channels)) {
+      if (!normalized.channels[key] && saved.channels[key]) {
+        normalized.channels[key] = saved.channels[key];
+      }
+    }
+  }
+
   for (const key of Object.keys(normalized.updates)) {
     if (!normalized.versions[key]) {
-      normalized.updates[key] = false;
+      normalized.updates[key] = null;
+      normalized.channels[key] = null;
     }
   }
 
@@ -1115,6 +1261,7 @@ return {
     summary,
     versions: appInfo.versions,
     updates: appInfo.updates,
+    channels: appInfo.channels,
     appStatus: {
       unifiOS: appInfo.versions.unifiOS ? "running" : "unknown",
       network: appInfo.versions.network ? "running" : "unknown",
@@ -1147,6 +1294,7 @@ return {
       networkSummary,
       appVersions: appInfo.versions,
       appUpdates: appInfo.updates,
+      appChannels: appInfo.channels,
       appStatus: {
         unifiOS: appInfo.versions.unifiOS ? "running" : "unknown",
         network: appInfo.versions.network ? "running" : "unknown",

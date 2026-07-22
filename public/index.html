@@ -1589,7 +1589,25 @@ function releaseNotesUrl(name, version) {
   return `/api/release-link?app=${encodeURIComponent(name)}&version=${encodeURIComponent(version)}`;
 }
 
-function setHeaderVersion(name, version, updateAvailable) {
+function releaseChannelLabel(channel) {
+  const normalized = String(channel || "").trim().toLowerCase();
+
+  const labels = {
+    release: "Official",
+    official: "Official",
+    rc: "Release Candidate",
+    "release-candidate": "Release Candidate",
+    release_candidate: "Release Candidate",
+    beta: "Early Access",
+    ea: "Early Access",
+    "early-access": "Early Access",
+    early_access: "Early Access"
+  };
+
+  return labels[normalized] || channel || "Unknown";
+}
+
+function setHeaderVersion(name, version, updateAvailable, channel) {
   const valueEl = document.getElementById(`version-${name}`);
   const linkEl = document.getElementById(`link-${name}`);
   if (!valueEl || !linkEl) return;
@@ -1604,13 +1622,18 @@ function setHeaderVersion(name, version, updateAvailable) {
     return;
   }
 
-  valueEl.textContent = updateAvailable ? `${version} update` : version;
-  linkEl.href = releaseNotesUrl(name, version);
-  linkEl.title = "Open release notes";
+  const channelLabel = releaseChannelLabel(channel);
 
   if (updateAvailable) {
+    valueEl.textContent = `${version} → ${updateAvailable}`;
+    linkEl.href = releaseNotesUrl(name, updateAvailable);
+    linkEl.title =
+      `Installed: ${version}\nAvailable: ${updateAvailable}\nChannel: ${channelLabel}`;
     linkEl.classList.add("update");
   } else {
+    valueEl.textContent = version;
+    linkEl.href = releaseNotesUrl(name, version);
+    linkEl.title = `Current version: ${version}\nChannel: ${channelLabel}`;
     linkEl.classList.add("current");
   }
 }
@@ -1854,11 +1877,11 @@ async function loadStats() {
     showValue("wanStatus", health.status || "-");
     showValue("availability", health.availability === null || health.availability === undefined ? "-" : health.availability, health.availability !== null && health.availability !== undefined ? "%" : "");
 
-    setHeaderVersion("unifiOS", data.versions?.unifiOS, data.updates?.unifiOS);
-    setHeaderVersion("network", data.versions?.network, data.updates?.network);
-    setHeaderVersion("protect", data.versions?.protect, data.updates?.protect);
-    setHeaderVersion("talk", data.versions?.talk, data.updates?.talk);
-    setHeaderVersion("access", data.versions?.access, data.updates?.access);
+    setHeaderVersion("unifiOS", data.versions?.unifiOS, data.updates?.unifiOS, data.channels?.unifiOS);
+    setHeaderVersion("network", data.versions?.network, data.updates?.network, data.channels?.network);
+    setHeaderVersion("protect", data.versions?.protect, data.updates?.protect, data.channels?.protect);
+    setHeaderVersion("talk", data.versions?.talk, data.updates?.talk, data.channels?.talk);
+    setHeaderVersion("access", data.versions?.access, data.updates?.access, data.channels?.access);
 
     renderTopTalkers(data.insights?.topTalkers || []);
     renderApUtilization(data.insights?.apUtilization || []);
